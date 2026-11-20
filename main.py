@@ -1,130 +1,141 @@
-"""news-image-20261120 entry: write the pre-rendered front page to /output/entry.png.
+"""News image publisher for make.fun — news-image-20261120.
 
-The image is a static file shipped in this repository (entry.png, JPEG bytes
-under the .png name, as the rules allow). This program deterministically
-copies its exact bytes to the output directory. Standard library only, no
-network access, no randomness: two runs write byte-identical output.
+A one-image entry: "Sum up 20 November's world news in one image".
 
-Integrity is checked twice: the shipped source is verified before copying
-(size, SHA-256 and the JPEG start/end markers), and the written copy is
-verified again afterwards, so a corrupt source or a truncated write fails
-loudly instead of shipping a broken image to the judge.
+The artwork itself ships beside this script as ``entry.png``.  This program
+does not draw, fetch, or modify anything.  Its whole job is to hand the
+shipped artwork over to the output directory, but only after proving —
+twice, once on the source and once on the copy — that the bytes are exactly
+the artwork we shipped.  Any surprise (wrong size, wrong hash, a JPEG that
+does not start and end the way a JPEG must) aborts loudly instead of
+publishing a corrupt file.
+
+Pure standard library, no network, no randomness: the same input always
+produces the same output, byte for byte.
 """
 
+from __future__ import annotations
+
 import hashlib
-import os
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# --- The shipped artwork, as measured when it was packed -------------------
+# entry.png: 317693 bytes, verified live with sha256sum before this rewrite.
+ARTWORK_NAME = "entry.png"
+ARTWORK_BYTES = 317693
+ARTWORK_SHA256 = "5e74b9b8d3819915a6ff00d837f0d9a2447bab4cab2c2ddeaa59b919500a807f"
 
-# Fingerprint of the shipped image, recorded at build time (20 Nov 2026).
-EXPECTED_SIZE = 317693
-EXPECTED_SHA256 = "5e74b9b8d3819915a6ff00d837f0d9a2447bab4cab2c2ddeaa59b919500a807f"
-JPEG_SOI = b"\xff\xd8"  # start of image
-JPEG_EOI = b"\xff\xd9"  # end of image
+# JPEG framing markers: a file must open with SOI and close with EOI.
+JPEG_OPEN = b"\xff\xd8"   # Start Of Image
+JPEG_CLOSE = b"\xff\xd9"  # End Of Image
 
-CHUNK = 65536
-
-
-def _fail(message: str) -> "SystemExit":
-    return SystemExit("error: news-image-20261120: " + message)
-
-
-def _sha256_of(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+DEFAULT_OUTPUT_DIR = Path("/output")
 
 
-def _check_jpeg_markers(path: str, size: int) -> None:
-    """The file must start with SOI and end with EOI: a whole JPEG image,
-    every segment through to its end marker, as the rules require."""
-    with open(path, "rb") as f:
-        head = f.read(2)
-        f.seek(max(0, size - 2))
-        tail = f.read(2)
-    if head != JPEG_SOI:
-        raise _fail(
-            "%s does not start with the JPEG SOI marker (FFD8); "
-            "not a whole JPEG image" % path
-        )
-    if tail != JPEG_EOI:
-        raise _fail(
-            "%s does not end with the JPEG EOI marker (FFD9); "
-            "image is truncated" % path
+@dataclass(frozen=True)
+class ArtworkReport:
+    """Everything we measured about one file holding the artwork."""
+
+    path: Path
+    size: int
+    sha256: str
+    opens_as_jpeg: bool
+    closes_as_jpeg: bool
+
+    @property
+    def is_sound(self) -> bool:
+        """True only when every measured fact matches the shipped artwork."""
+        return (
+            self.size == ARTWORK_BYTES
+            and self.sha256 == ARTWORK_SHA256
+            and self.opens_as_jpeg
+            and self.closes_as_jpeg
         )
 
-
-def _verify(path: str, role: str) -> None:
-    size = os.path.getsize(path)
-    if size != EXPECTED_SIZE:
-        raise _fail(
-            "%s %s is %d bytes, expected %d; refusing to continue"
-            % (role, path, size, EXPECTED_SIZE)
-        )
-    if _sha256_of(path) != EXPECTED_SHA256:
-        raise _fail("%s %s failed its SHA-256 check" % (role, path))
-    _check_jpeg_markers(path, size)
-
-
-def _prepare_output_dir(out_dir: str) -> str:
-    """Validate the output directory before any write happens, so a bad
-    destination fails fast with a clear message instead of dying mid-copy."""
-    if not out_dir:
-        raise _fail(
-            "MAKEFUN_OUTPUT_DIR is set but empty; unset it to use /output"
-        )
-    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
-        raise _fail(
-            "output path %s exists and is not a directory; "
-            "point MAKEFUN_OUTPUT_DIR at a directory" % out_dir
-        )
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as exc:
-        raise _fail("cannot create output directory %s: %s" % (out_dir, exc))
-    if not os.access(out_dir, os.W_OK):
-        raise _fail("output directory %s is not writable" % out_dir)
-    return out_dir
+    def complaints(self) -> list[str]:
+        """Human-readable list of every mismatch found, empty when sound."""
+        gripes: list[str] = []
+        if self.size != ARTWORK_BYTES:
+            gripes.append(
+                f"size is {self.size} bytes, expected {ARTWORK_BYTES}"
+            )
+        if self.sha256 != ARTWORK_SHA256:
+            gripes.append(
+                f"SHA-256 is {self.sha256}, expected {ARTWORK_SHA256}"
+            )
+        if not self.opens_as_jpeg:
+            gripes.append("missing JPEG SOI marker (FFD8) at the start")
+        if not self.closes_as_jpeg:
+            gripes.append("missing JPEG EOI marker (FFD9) at the end")
+        return gripes
 
 
-def main() -> int:
-    out_dir = _prepare_output_dir(
-        os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+def measure(path: Path) -> ArtworkReport:
+    """Read a file and report its size, hash, and JPEG framing markers."""
+    blob = path.read_bytes()
+    return ArtworkReport(
+        path=path,
+        size=len(blob),
+        sha256=hashlib.sha256(blob).hexdigest(),
+        opens_as_jpeg=blob[:2] == JPEG_OPEN,
+        closes_as_jpeg=blob[-2:] == JPEG_CLOSE,
     )
-    src = os.path.join(HERE, "entry.png")
-    dst = os.path.join(out_dir, "entry.png")
-    if os.path.isdir(dst):
-        raise _fail(
-            "output path %s is a directory, cannot write the image there"
-            % dst
+
+
+def insist_sound(report: ArtworkReport, role: str) -> None:
+    """Abort with a clear error unless the measured file is the artwork."""
+    problems = report.complaints()
+    if problems:
+        detail = "; ".join(problems)
+        raise SystemExit(f"error: {role} {report.path} failed verification: {detail}")
+
+
+def hand_over(source: Path, out_dir: Path) -> Path:
+    """Verify the source, copy it, then verify the copy. Returns the copy."""
+    checked_source = measure(source)
+    insist_sound(checked_source, "source")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / ARTWORK_NAME
+    target.write_bytes(source.read_bytes())
+
+    checked_target = measure(target)
+    insist_sound(checked_target, "output")
+    if checked_target.sha256 != checked_source.sha256:
+        raise SystemExit(
+            f"error: output {target} differs from source {source} after copy"
         )
+    # Belt and braces: the hashes already agree, but confirm the bytes
+    # themselves are identical before declaring success.
+    if target.read_bytes() != source.read_bytes():
+        raise SystemExit(
+            f"error: output {target} bytes differ from source {source}"
+        )
+    return target
 
-    # 1. Verify the shipped source before copying anything.
-    if not os.path.isfile(src):
-        raise _fail("shipped image missing: %s not found" % src)
-    _verify(src, "source")
 
-    # 2. Stream-copy the bytes (never loads the whole file into memory).
-    try:
-        with open(src, "rb") as f_in, open(dst, "wb") as f_out:
-            while True:
-                chunk = f_in.read(CHUNK)
-                if not chunk:
-                    break
-                f_out.write(chunk)
-    except OSError as exc:
-        raise _fail("failed writing %s: %s" % (dst, exc))
+def main(argv: list[str]) -> int:
+    """Publish entry.png to /output (or argv[1] when given)."""
+    if len(argv) > 2:
+        print(
+            "usage: main.py [output-dir]",
+            file=sys.stderr,
+        )
+        return 2
 
-    # 3. Verify the written copy: size + SHA-256 + JPEG markers.
-    _verify(dst, "output")
+    here = Path(__file__).resolve().parent
+    source = here / ARTWORK_NAME
+    if not source.is_file():
+        print(f"error: shipped artwork not found: {source}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(argv[1]) if len(argv) == 2 else DEFAULT_OUTPUT_DIR
+    published = hand_over(source, out_dir)
+    print(f"published {published} ({ARTWORK_BYTES} bytes, SHA-256 verified)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main(sys.argv))
