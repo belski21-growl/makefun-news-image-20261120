@@ -1,97 +1,168 @@
-"""Publish the r2 front-page artwork for make.fun — news-image-20261120.
+"""Ship the r2-fix front-page artwork for make.fun - news-image-20261120.
 
-The entry is one image, "THE WORLD IN ONE DAY — Friday, 20 November
-2026", shipped beside this script as ``entry.png`` (a JPEG file carrying
-the .png name, which the rules allow: the format is told apart by the
-first bytes).  This program draws nothing, fetches nothing and writes
-nothing but the one output file.  It reads the shipped artwork, proves
-it is exactly the file that was packed (byte count, SHA-256, and the
-JPEG start/end markers), copies it to the output directory, and proves
-the copy the same way before reporting success.  Any mismatch aborts
-with a plain error message and a non-zero exit code.
+The entry is one image, "THE WORLD IN ONE DAY - Friday, 20 November
+2026", shipped beside this script as ``entry.png``. The file is really a
+JPEG (the rules tell the format apart by its first bytes, so the .png
+name is fine). This program draws nothing, reaches for no network and
+writes nothing but the one output file: it fingerprints the shipped
+artwork (byte count, SHA-256, and the JPEG start/end markers), streams
+it to the output directory in 64 KiB chunks, then fingerprints the copy
+the same way and refuses to report success unless the two fingerprints
+agree exactly. Any mismatch stops the run with a plain error message
+and a non-zero exit code.
 
-Standard library only, no network, no randomness: the same shipped
-file always publishes the same bytes.
+Python 3.13, standard library only, fully deterministic: the same
+shipped file always publishes the same bytes.
 """
 
 import hashlib
-import shutil
+import os
 import sys
-from pathlib import Path
 
-# The artwork as packed for round 2 (measured live with sha256sum).
+# The artwork as packed for the r2-fix round (measured live with sha256sum).
 FILE_NAME = "entry.png"
-EXPECTED_SIZE = 341440
+EXPECTED_SIZE = 373859
 EXPECTED_SHA256 = (
-    "aba7330862a21dad7dabacbf7aeabb5feb02ca7047d5547e5db34dd272599fdc"
+    "e0010bd35157f8d5916b19b2c5aae20d97827f2c60a2262e44fcd7812ea77b5b"
 )
+SIZE_LIMIT = 1048576
 
 # A JPEG must begin with SOI (FFD8) and end with EOI (FFD9).
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
 
-DEFAULT_OUT = Path("/output")
+CHUNK = 65536
+DEFAULT_OUT = "/output"
 
 
-def die(message):
-    """Print an error and stop the run without publishing anything."""
-    print(f"error: {message}", file=sys.stderr)
+def fail(message):
+    """Stop the run with a plain error; nothing is published."""
+    print("error: " + message, file=sys.stderr)
     raise SystemExit(1)
 
 
-def digest_file(path):
-    """Return (size, sha256 hex) for the file at *path*."""
-    data = Path(path).read_bytes()
-    return len(data), hashlib.sha256(data).hexdigest()
+def read_fingerprint(path):
+    """Return (size, sha256 hex, first-two-bytes, last-two-bytes)."""
+    digest = hashlib.sha256()
+    size = 0
+    head = b""
+    tail = b""
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(CHUNK)
+            if not block:
+                break
+            if size == 0:
+                head = block[:2]
+            tail = block[-2:]
+            size += len(block)
+            digest.update(block)
+    return size, digest.hexdigest(), head, tail
 
 
-def framing_ok(path):
-    """True when the file opens with FFD8 and closes with FFD9."""
-    data = Path(path).read_bytes()
-    return data[:2] == SOI and data[-2:] == EOI
+def jpeg_segments_sound(path):
+    """Walk the JPEG marker segments from SOI to EOI.
+
+    A file can carry the right first and last bytes yet be truncated
+    in the middle, so prove the structure too: every marker must have
+    its declared length inside the file, and the walk must land exactly
+    on the EOI marker at the end. Returns True when the walk succeeds.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if len(data) < 4 or data[:2] != SOI:
+        return False
+    pos = 2
+    while pos + 1 < len(data):
+        if data[pos] != 0xFF:
+            return False
+        marker = data[pos + 1]
+        if marker == 0xD9:  # EOI
+            return pos + 2 == len(data)
+        if marker == 0xD8 or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            pos += 2  # standalone marker, no length field
+            continue
+        if pos + 4 > len(data):
+            return False
+        length = (data[pos + 2] << 8) | data[pos + 3]
+        if length < 2 or pos + 2 + length > len(data):
+            return False
+        pos += 2 + length
+        if marker == 0xDA:  # SOS: compressed scan data follows.
+            # Scan data runs to EOI; 0xFF00 is a stuffed data byte and
+            # 0xFFD0-0xFFD7 are restart markers, not segment headers.
+            while pos + 1 < len(data):
+                if data[pos] != 0xFF:
+                    pos += 1
+                    continue
+                following = data[pos + 1]
+                if following == 0x00 or 0xD0 <= following <= 0xD7:
+                    pos += 2
+                    continue
+                if following == 0xD9:  # EOI
+                    return pos + 2 == len(data)
+                return False
+            return False
+    return False
 
 
-def check_file(path, label):
+def confirm_artwork(path, label):
     """Refuse unless *path* is byte-for-byte the packed artwork."""
-    size, digest = digest_file(path)
+    if not os.path.isfile(path):
+        fail(label + " artwork not found: " + path)
+    size, digest, head, tail = read_fingerprint(path)
     if size != EXPECTED_SIZE:
-        die(f"{label} {path}: {size} bytes, expected {EXPECTED_SIZE}")
+        fail("%s %s: %d bytes, expected %d"
+             % (label, path, size, EXPECTED_SIZE))
+    if size > SIZE_LIMIT:
+        fail("%s %s: %d bytes, over the 1 MiB limit"
+             % (label, path, size))
     if digest != EXPECTED_SHA256:
-        die(f"{label} {path}: SHA-256 {digest}, expected {EXPECTED_SHA256}")
-    if not framing_ok(path):
-        die(f"{label} {path}: not a whole JPEG (missing FFD8 start or FFD9 end)")
+        fail("%s %s: SHA-256 %s, expected %s"
+             % (label, path, digest, EXPECTED_SHA256))
+    if head != SOI or tail != EOI:
+        fail(label + " " + path
+             + ": not a whole JPEG (missing FFD8 start or FFD9 end)")
+    if not jpeg_segments_sound(path):
+        fail(label + " " + path
+             + ": JPEG marker walk does not reach a clean EOI")
 
 
-def publish_entry(source, out_dir):
-    """Verify the shipped file, copy it, verify the copy. Return its path."""
-    check_file(source, "source")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target = out_dir / FILE_NAME
-    shutil.copyfile(source, target)
-    check_file(target, "output")
-    # The hashes already agree, but confirm the bytes themselves match
-    # before declaring success: a hash collision in theory, a bad copy
-    # in practice, would both slip past a hash-only check.
-    if target.read_bytes() != source.read_bytes():
-        die(f"output {target} bytes differ from source {source} after copy")
+def ship(source, out_dir):
+    """Verify the shipped file, stream-copy it, verify the copy."""
+    confirm_artwork(source, "source")
+    if not os.path.isdir(out_dir):
+        try:
+            os.makedirs(out_dir)
+        except OSError as exc:
+            fail("cannot create output directory %s: %s" % (out_dir, exc))
+    target = os.path.join(out_dir, FILE_NAME)
+    if os.path.abspath(target) == os.path.abspath(source):
+        fail("output %s is the shipped file itself; refusing to copy "
+             "a file onto itself" % target)
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        while True:
+            block = reader.read(CHUNK)
+            if not block:
+                break
+            writer.write(block)
+    confirm_artwork(target, "output")
     return target
 
 
-def run(argv):
+def main(argv):
     """Publish entry.png to /output, or to argv[1] when given."""
     if len(argv) > 2:
         print("usage: main.py [output-dir]", file=sys.stderr)
         return 2
-    here = Path(__file__).resolve().parent
-    source = here / FILE_NAME
-    if not source.is_file():
-        die(f"shipped artwork not found: {source}")
-    out_dir = Path(argv[1]) if len(argv) == 2 else DEFAULT_OUT
-    target = publish_entry(source, out_dir)
-    print(f"published {target} ({EXPECTED_SIZE} bytes, SHA-256 verified)")
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(here, FILE_NAME)
+    out_dir = argv[1] if len(argv) == 2 else DEFAULT_OUT
+    target = ship(source, out_dir)
+    print("published %s (%d bytes, SHA-256 verified)"
+          % (target, EXPECTED_SIZE))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv))
+    raise SystemExit(main(sys.argv))
